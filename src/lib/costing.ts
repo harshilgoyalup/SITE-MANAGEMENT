@@ -69,6 +69,7 @@ export interface Payment {
 
 export interface CostingData {
   version: 1;
+  businessName?: string;
   sites: Site[];
   materials: MaterialEntry[];
   labour: LabourEntry[];
@@ -149,6 +150,7 @@ export function normalizeData(input: unknown): CostingData {
   const d = (input ?? {}) as Partial<CostingData>;
   return {
     version: 1,
+    businessName: typeof d.businessName === 'string' ? d.businessName : '',
     sites: Array.isArray(d.sites) ? d.sites : [],
     materials: Array.isArray(d.materials) ? d.materials : [],
     labour: Array.isArray(d.labour) ? d.labour : [],
@@ -263,7 +265,7 @@ export function siteCsv(data: CostingData, siteId: string): string {
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
   const rows: unknown[][] = [];
-  rows.push(['COSTING SHEET']);
+  rows.push([data.businessName ? `${data.businessName} - COSTING SHEET` : 'COSTING SHEET']);
   rows.push(['Site', site.name]);
   rows.push(['Client', site.clientName]);
   rows.push(['Location', site.location]);

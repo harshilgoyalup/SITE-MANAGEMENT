@@ -1,1195 +1,1063 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { useAuth } from '../context/AuthContext';
-import { db } from '../lib/firebase';
-import { 
-  collection, 
-  query, 
-  onSnapshot, 
-  doc, 
-  updateDoc, 
-  setDoc,
-  where,
-  getDoc,
-  addDoc
-} from 'firebase/firestore';
-import { Job, JobStatus, PaymentRecord, ReviewRecord, PlatformSettings, NotificationRecord, WorkerProfile } from '../lib/types';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  CostingData,
+  ExpenseEntry,
+  LabourEntry,
+  LabourPayType,
+  MaterialEntry,
+  Payment,
+  Site,
+  SiteStatus,
+  EXPENSE_CATEGORIES,
+  LABOUR_TRADES,
+  MATERIAL_CATEGORIES,
+  MATERIAL_UNITS,
+  PAYMENT_MODES,
+  downloadFile,
+  emptyData,
+  labourAmount,
+  loadData,
+  money,
+  newId,
+  normalizeData,
+  round2,
+  saveData,
+  siteCsv,
+  summarize,
+  today,
+} from '../lib/costing';
 
-function LiveWorkerTimer({ punchInTime, hourlyRate, currency = '₹' }: { punchInTime: string; hourlyRate: number; currency?: string }) {
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+type Tab = 'sheet' | 'material' | 'labour' | 'expenses' | 'payments';
+
+const inputCls =
+  'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-200';
+const labelCls = 'block text-xs font-semibold text-slate-600 mb-1';
+const btnPrimary =
+  'rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50';
+const btnGhost =
+  'rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50';
+const btnDanger = 'rounded-lg px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50';
+const btnSmall = 'rounded-lg px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100';
+
+const STATUS_LABEL: Record<SiteStatus, string> = { ACTIVE: 'Active', ON_HOLD: 'On Hold', COMPLETED: 'Completed' };
+const STATUS_CLS: Record<SiteStatus, string> = {
+  ACTIVE: 'bg-emerald-100 text-emerald-800',
+  ON_HOLD: 'bg-amber-100 text-amber-800',
+  COMPLETED: 'bg-slate-200 text-slate-700',
+};
+
+const num = (v: string) => {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+export default function CostingPage() {
+  const [data, setData] = useState<CostingData>(emptyData);
+  const [loaded, setLoaded] = useState(false);
+  const [activeSiteId, setActiveSiteId] = useState<string | null>(null);
+  const [showSiteForm, setShowSiteForm] = useState<Site | 'new' | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const calc = () => {
-      const start = new Date(punchInTime).getTime();
-      const now = new Date().getTime();
-      setElapsedSeconds(Math.max(0, Math.floor((now - start) / 1000)));
-    };
-    calc();
-    const timer = setInterval(calc, 1000);
-    return () => clearInterval(timer);
-  }, [punchInTime]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate from browser storage once on mount
+    setData(loadData());
+    setLoaded(true);
+  }, []);
 
-  const hrs = Math.floor(elapsedSeconds / 3600);
-  const mins = Math.floor((elapsedSeconds % 3600) / 60);
-  const secs = elapsedSeconds % 60;
+  useEffect(() => {
+    if (loaded) saveData(data);
+  }, [data, loaded]);
 
-  const totalMins = Math.floor(elapsedSeconds / 60);
-  const stdMins = Math.min(totalMins, 480);
-  const otMins = Math.max(0, totalMins - 480);
+  const update = (fn: (d: CostingData) => CostingData) => setData((d) => fn(d));
 
-  const stdPay = Math.round((stdMins / 60) * hourlyRate);
-  const otPay = Math.round((otMins / 60) * (hourlyRate * 1.5));
-  const totalEarnings = stdPay + otPay;
+  const saveSite = (site: Site) => {
+    update((d) => {
+      const exists = d.sites.some((s) => s.id === site.id);
+      return { ...d, sites: exists ? d.sites.map((s) => (s.id === site.id ? site : s)) : [...d.sites, site] };
+    });
+    setShowSiteForm(null);
+    setActiveSiteId(site.id);
+  };
+
+  const deleteSite = (id: string) => {
+    const site = data.sites.find((s) => s.id === id);
+    if (!site) return;
+    if (!window.confirm(`Delete site "${site.name}" and ALL its entries? This cannot be undone.`)) return;
+    update((d) => ({
+      ...d,
+      sites: d.sites.filter((s) => s.id !== id),
+      materials: d.materials.filter((m) => m.siteId !== id),
+      labour: d.labour.filter((l) => l.siteId !== id),
+      expenses: d.expenses.filter((e) => e.siteId !== id),
+      payments: d.payments.filter((p) => p.siteId !== id),
+    }));
+    setActiveSiteId(null);
+  };
+
+  const editBusinessName = () => {
+    const name = window.prompt('Your business / firm name (shown on costing sheets):', data.businessName ?? '');
+    if (name !== null) update((d) => ({ ...d, businessName: name.trim() }));
+  };
+
+  const exportBackup = () => {
+    downloadFile(`costing-backup-${today()}.json`, JSON.stringify(data, null, 2), 'application/json');
+  };
+
+  const importBackup = async (file: File) => {
+    try {
+      const parsed = normalizeData(JSON.parse(await file.text()));
+      if (!window.confirm(`Restore backup with ${parsed.sites.length} site(s)? Current data will be replaced.`)) return;
+      setData(parsed);
+      setActiveSiteId(null);
+    } catch {
+      window.alert('Could not read this file. Please choose a backup .json exported from this app.');
+    }
+  };
+
+  const activeSite = data.sites.find((s) => s.id === activeSiteId) ?? null;
 
   return (
-    <div className="bg-emerald-950 text-emerald-100 border border-emerald-800/80 rounded-2xl p-4 shadow-md space-y-3 my-2">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="relative flex h-3 w-3">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-400"></span>
-          </span>
-          <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">On-Site Shift Active</span>
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur print:hidden">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+          <button onClick={() => setActiveSiteId(null)} className="flex items-center gap-2 text-left">
+            <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-amber-500 font-black text-white">₹</span>
+            <span>
+              <span className="block text-base font-bold leading-tight">{data.businessName || 'Site Costing'}</span>
+              <span className="block text-xs text-slate-500">Material · Labour · Costing Sheets</span>
+            </span>
+          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button className={btnGhost} onClick={exportBackup}>Backup</button>
+            <button className={btnGhost} onClick={() => fileRef.current?.click()}>Restore</button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) importBackup(f);
+                e.target.value = '';
+              }}
+            />
+            <button className={btnGhost} onClick={editBusinessName}>Business name</button>
+          </div>
         </div>
-        <span className="text-[11px] font-mono text-emerald-300">Started: {new Date(punchInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-      </div>
+      </header>
 
-      <div className="flex items-baseline justify-between border-y border-emerald-900 py-2.5">
-        <div>
-          <span className="text-[11px] text-emerald-400 block mb-0.5">Shift Clock</span>
-          <span className="text-3xl font-black font-mono tracking-tight text-white">
-            {String(hrs).padStart(2, '0')}:{String(mins).padStart(2, '0')}:{String(secs).padStart(2, '0')}
-          </span>
-        </div>
-        <div className="text-right">
-          <span className="text-[11px] text-emerald-400 block mb-0.5">Earned So Far</span>
-          <span className="text-2xl font-black text-amber-400">{currency}{totalEarnings}</span>
-        </div>
-      </div>
-
-      <div className="flex justify-between text-[11px] text-emerald-300">
-        <span>Rate: {currency}{hourlyRate}/hr</span>
-        {otMins > 0 ? (
-          <span className="text-amber-400 font-bold">Overtime Active (1.5×): {otMins} mins</span>
+      <main className="mx-auto max-w-6xl px-4 py-6">
+        {!loaded ? (
+          <p className="text-sm text-slate-500">Loading…</p>
+        ) : activeSite ? (
+          <SiteView
+            key={activeSite.id}
+            site={activeSite}
+            data={data}
+            update={update}
+            onBack={() => setActiveSiteId(null)}
+            onEdit={() => setShowSiteForm(activeSite)}
+            onDelete={() => deleteSite(activeSite.id)}
+          />
         ) : (
-          <span>Standard Shift (Max 8 hrs)</span>
+          <Dashboard data={data} onOpen={setActiveSiteId} onNew={() => setShowSiteForm('new')} />
         )}
+      </main>
+
+      {showSiteForm && (
+        <SiteForm
+          initial={showSiteForm === 'new' ? null : showSiteForm}
+          onCancel={() => setShowSiteForm(null)}
+          onSave={saveSite}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Dashboard */
+
+function Dashboard({ data, onOpen, onNew }: { data: CostingData; onOpen: (id: string) => void; onNew: () => void }) {
+  const [filter, setFilter] = useState<SiteStatus | 'ALL'>('ALL');
+  const rows = useMemo(
+    () => data.sites.map((s) => ({ site: s, sum: summarize(data, s.id) })),
+    [data],
+  );
+  const shown = rows.filter((r) => filter === 'ALL' || r.site.status === filter);
+  const totals = rows.reduce(
+    (t, r) => ({
+      material: t.material + r.sum.material,
+      labour: t.labour + r.sum.labour,
+      expenses: t.expenses + r.sum.expenses,
+      cost: t.cost + r.sum.totalCost,
+      unpaid: t.unpaid + r.sum.unpaid,
+      due: t.due + Math.max(0, r.sum.contractValue - r.sum.received),
+    }),
+    { material: 0, labour: 0, expenses: 0, cost: 0, unpaid: 0, due: 0 },
+  );
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+        <Stat label="Sites" value={String(data.sites.length)} />
+        <Stat label="Material" value={money(totals.material)} />
+        <Stat label="Labour" value={money(totals.labour)} />
+        <Stat label="Other Exp." value={money(totals.expenses)} />
+        <Stat label="Pending to pay" value={money(totals.unpaid)} tone="warn" />
+        <Stat label="To receive" value={money(totals.due)} tone="good" />
+      </div>
+
+      <div className="rounded-xl border border-slate-200 bg-white">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 p-4">
+          <h2 className="text-lg font-bold">My Sites</h2>
+          <div className="flex flex-wrap items-center gap-2">
+            <select className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" value={filter} onChange={(e) => setFilter(e.target.value as SiteStatus | 'ALL')}>
+              <option value="ALL">All sites</option>
+              <option value="ACTIVE">Active</option>
+              <option value="ON_HOLD">On Hold</option>
+              <option value="COMPLETED">Completed</option>
+            </select>
+            <button className={btnPrimary} onClick={onNew}>+ Add Site</button>
+          </div>
+        </div>
+
+        {data.sites.length === 0 ? (
+          <div className="p-10 text-center">
+            <p className="text-base font-semibold">No sites yet</p>
+            <p className="mt-1 text-sm text-slate-500">Add your first site, then record material, labour and expenses against it.</p>
+            <button className={btnPrimary + ' mt-4'} onClick={onNew}>+ Add your first site</button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[760px] text-sm">
+              <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+                <tr>
+                  <th className="px-4 py-2">Site</th>
+                  <th className="px-4 py-2">Status</th>
+                  <th className="px-4 py-2 text-right">Material</th>
+                  <th className="px-4 py-2 text-right">Labour</th>
+                  <th className="px-4 py-2 text-right">Total Cost</th>
+                  <th className="px-4 py-2 text-right">Contract</th>
+                  <th className="px-4 py-2 text-right">Profit</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map(({ site, sum }) => (
+                  <tr key={site.id} className="cursor-pointer border-t border-slate-100 hover:bg-amber-50" onClick={() => onOpen(site.id)}>
+                    <td className="px-4 py-3">
+                      <div className="font-semibold">{site.name}</div>
+                      <div className="text-xs text-slate-500">{[site.clientName, site.location].filter(Boolean).join(' · ')}</div>
+                    </td>
+                    <td className="px-4 py-3"><StatusBadge status={site.status} /></td>
+                    <td className="px-4 py-3 text-right tabular-nums">{money(sum.material)}</td>
+                    <td className="px-4 py-3 text-right tabular-nums">{money(sum.labour)}</td>
+                    <td className="px-4 py-3 text-right font-semibold tabular-nums">{money(sum.totalCost)}</td>
+                    <td className="px-4 py-3 text-right tabular-nums">{sum.contractValue ? money(sum.contractValue) : '—'}</td>
+                    <td className={`px-4 py-3 text-right font-semibold tabular-nums ${sum.profit < 0 ? 'text-red-600' : 'text-emerald-700'}`}>
+                      {sum.contractValue ? `${money(sum.profit)} (${sum.marginPct}%)` : '—'}
+                    </td>
+                  </tr>
+                ))}
+                {shown.length === 0 && (
+                  <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-500">No sites with this status.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <p className="text-xs text-slate-500">
+        Data is saved on this device/browser. Use <b>Backup</b> regularly to download a copy, and <b>Restore</b> to load it on another device.
+      </p>
+    </div>
+  );
+}
+
+function Stat({ label, value, tone }: { label: string; value: string; tone?: 'warn' | 'good' | 'bad' }) {
+  const toneCls = tone === 'warn' ? 'text-amber-700' : tone === 'good' ? 'text-emerald-700' : tone === 'bad' ? 'text-red-600' : 'text-slate-900';
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-3">
+      <div className="text-xs font-medium text-slate-500">{label}</div>
+      <div className={`mt-1 truncate text-lg font-bold tabular-nums ${toneCls}`}>{value}</div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: SiteStatus }) {
+  return <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_CLS[status]}`}>{STATUS_LABEL[status]}</span>;
+}
+
+/* ---------------------------------------------------------------- Site form */
+
+function SiteForm({ initial, onCancel, onSave }: { initial: Site | null; onCancel: () => void; onSave: (s: Site) => void }) {
+  const [f, setF] = useState({
+    name: initial?.name ?? '',
+    clientName: initial?.clientName ?? '',
+    clientPhone: initial?.clientPhone ?? '',
+    location: initial?.location ?? '',
+    startDate: initial?.startDate ?? today(),
+    contractValue: initial ? String(initial.contractValue || '') : '',
+    status: initial?.status ?? ('ACTIVE' as SiteStatus),
+    notes: initial?.notes ?? '',
+  });
+  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) =>
+    setF({ ...f, [k]: e.target.value });
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!f.name.trim()) return;
+    onSave({
+      id: initial?.id ?? newId(),
+      createdAt: initial?.createdAt ?? new Date().toISOString(),
+      name: f.name.trim(),
+      clientName: f.clientName.trim(),
+      clientPhone: f.clientPhone.trim(),
+      location: f.location.trim(),
+      startDate: f.startDate,
+      contractValue: num(f.contractValue),
+      status: f.status,
+      notes: f.notes.trim(),
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-30 flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4" onClick={onCancel}>
+      <form
+        onSubmit={submit}
+        onClick={(e) => e.stopPropagation()}
+        className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-2xl bg-white p-5 sm:rounded-2xl"
+      >
+        <h3 className="mb-4 text-lg font-bold">{initial ? 'Edit Site' : 'Add New Site'}</h3>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <label className={labelCls}>Site name *</label>
+            <input className={inputCls} value={f.name} onChange={set('name')} placeholder="e.g. Sharma Residence – 3BHK" required autoFocus />
+          </div>
+          <div>
+            <label className={labelCls}>Client name</label>
+            <input className={inputCls} value={f.clientName} onChange={set('clientName')} />
+          </div>
+          <div>
+            <label className={labelCls}>Client phone</label>
+            <input className={inputCls} value={f.clientPhone} onChange={set('clientPhone')} inputMode="tel" />
+          </div>
+          <div className="sm:col-span-2">
+            <label className={labelCls}>Location / address</label>
+            <input className={inputCls} value={f.location} onChange={set('location')} />
+          </div>
+          <div>
+            <label className={labelCls}>Start date</label>
+            <input type="date" className={inputCls} value={f.startDate} onChange={set('startDate')} />
+          </div>
+          <div>
+            <label className={labelCls}>Contract / quoted value (₹)</label>
+            <input type="number" min="0" step="any" className={inputCls} value={f.contractValue} onChange={set('contractValue')} placeholder="0" />
+          </div>
+          <div>
+            <label className={labelCls}>Status</label>
+            <select className={inputCls} value={f.status} onChange={set('status')}>
+              <option value="ACTIVE">Active</option>
+              <option value="ON_HOLD">On Hold</option>
+              <option value="COMPLETED">Completed</option>
+            </select>
+          </div>
+          <div className="sm:col-span-2">
+            <label className={labelCls}>Notes / scope of work</label>
+            <textarea className={inputCls} rows={2} value={f.notes} onChange={set('notes')} />
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className={btnGhost} onClick={onCancel}>Cancel</button>
+          <button type="submit" className={btnPrimary}>{initial ? 'Save' : 'Add Site'}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Site view */
+
+interface SiteViewProps {
+  site: Site;
+  data: CostingData;
+  update: (fn: (d: CostingData) => CostingData) => void;
+  onBack: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}
+
+function SiteView({ site, data, update, onBack, onEdit, onDelete }: SiteViewProps) {
+  const [tab, setTab] = useState<Tab>('sheet');
+  const sum = useMemo(() => summarize(data, site.id), [data, site.id]);
+
+  const counts = {
+    material: data.materials.filter((m) => m.siteId === site.id).length,
+    labour: data.labour.filter((l) => l.siteId === site.id).length,
+    expenses: data.expenses.filter((e) => e.siteId === site.id).length,
+    payments: data.payments.filter((p) => p.siteId === site.id).length,
+  };
+
+  const tabs: { id: Tab; label: string }[] = [
+    { id: 'sheet', label: 'Costing Sheet' },
+    { id: 'material', label: `Material (${counts.material})` },
+    { id: 'labour', label: `Labour (${counts.labour})` },
+    { id: 'expenses', label: `Other Exp. (${counts.expenses})` },
+    { id: 'payments', label: `Client Payments (${counts.payments})` },
+  ];
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-3 print:hidden">
+        <div>
+          <button onClick={onBack} className="mb-1 text-sm text-slate-500 hover:text-slate-900">← All sites</button>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-2xl font-bold">{site.name}</h1>
+            <StatusBadge status={site.status} />
+          </div>
+          <p className="text-sm text-slate-500">
+            {[site.clientName, site.clientPhone, site.location, site.startDate && `Started ${site.startDate}`].filter(Boolean).join(' · ')}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button className={btnGhost} onClick={onEdit}>Edit site</button>
+          <button className={btnGhost + ' text-red-600'} onClick={onDelete}>Delete</button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 print:hidden">
+        <Stat label="Total Cost" value={money(sum.totalCost)} />
+        <Stat label="Contract Value" value={sum.contractValue ? money(sum.contractValue) : 'Not set'} />
+        <Stat label="Profit / Loss" value={sum.contractValue ? money(sum.profit) : '—'} tone={sum.profit < 0 ? 'bad' : 'good'} />
+        <Stat label="Pending to pay" value={money(sum.unpaid)} tone="warn" />
+      </div>
+
+      <div className="flex gap-1 overflow-x-auto border-b border-slate-200 print:hidden">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`whitespace-nowrap border-b-2 px-3 py-2 text-sm font-semibold ${
+              tab === t.id ? 'border-amber-500 text-slate-900' : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'sheet' && <CostingSheet site={site} data={data} />}
+      {tab === 'material' && <MaterialTab siteId={site.id} data={data} update={update} />}
+      {tab === 'labour' && <LabourTab siteId={site.id} data={data} update={update} />}
+      {tab === 'expenses' && <ExpenseTab siteId={site.id} data={data} update={update} />}
+      {tab === 'payments' && <PaymentTab siteId={site.id} data={data} update={update} />}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Costing sheet */
+
+function CostingSheet({ site, data }: { site: Site; data: CostingData }) {
+  const sum = summarize(data, site.id);
+  const [overheadPct, setOverheadPct] = useState('10');
+  const [profitPct, setProfitPct] = useState('20');
+  const [gstPct, setGstPct] = useState('18');
+
+  const overhead = round2(sum.totalCost * (num(overheadPct) / 100));
+  const costWithOh = round2(sum.totalCost + overhead);
+  const profit = round2(costWithOh * (num(profitPct) / 100));
+  const beforeTax = round2(costWithOh + profit);
+  const gst = round2(beforeTax * (num(gstPct) / 100));
+  const quote = round2(beforeTax + gst);
+
+  const breakdown = (title: string, map: Record<string, number>, total: number) => (
+    <div>
+      <h4 className="mb-2 text-sm font-bold uppercase tracking-wide text-slate-600">{title}</h4>
+      <table className="w-full text-sm">
+        <tbody>
+          {Object.entries(map)
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => (
+              <tr key={k} className="border-b border-slate-100">
+                <td className="py-1.5">{k}</td>
+                <td className="py-1.5 text-right tabular-nums">{money(v)}</td>
+                <td className="w-14 py-1.5 text-right text-xs text-slate-500 tabular-nums">{total ? Math.round((v / total) * 100) : 0}%</td>
+              </tr>
+            ))}
+          {Object.keys(map).length === 0 && (
+            <tr><td className="py-1.5 text-slate-400" colSpan={3}>No entries yet</td></tr>
+          )}
+          <tr className="font-bold">
+            <td className="pt-2">Total</td>
+            <td className="pt-2 text-right tabular-nums">{money(total)}</td>
+            <td />
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap gap-2 print:hidden">
+        <button className={btnPrimary} onClick={() => window.print()}>Print / Save as PDF</button>
+        <button
+          className={btnGhost}
+          onClick={() => downloadFile(`costing-${site.name.replace(/[^a-z0-9]+/gi, '-')}-${today()}.csv`, siteCsv(data, site.id), 'text/csv')}
+        >
+          Download Excel (CSV)
+        </button>
+      </div>
+
+      <div className="rounded-xl border border-slate-200 bg-white p-5 print:border-0 print:p-0">
+        <div className="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 pb-4">
+          <div>
+            <div className="text-xs font-bold uppercase tracking-widest text-amber-600">{data.businessName ? `${data.businessName} · ` : ''}Costing Sheet</div>
+            <h2 className="text-xl font-bold">{site.name}</h2>
+            <p className="text-sm text-slate-600">{[site.clientName, site.clientPhone].filter(Boolean).join(' · ')}</p>
+            <p className="text-sm text-slate-600">{site.location}</p>
+          </div>
+          <div className="text-sm text-slate-600 sm:text-right">
+            <div>Date: {today()}</div>
+            {site.startDate && <div>Started: {site.startDate}</div>}
+            <div>Status: {STATUS_LABEL[site.status]}</div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-6 md:grid-cols-3 print:grid-cols-3">
+          {breakdown('Material', sum.materialByCategory, sum.material)}
+          {breakdown('Labour', sum.labourByTrade, sum.labour)}
+          {breakdown('Other Expenses', sum.expensesByCategory, sum.expenses)}
+        </div>
+
+        <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-2 print:grid-cols-2">
+          <div className="rounded-lg bg-slate-50 p-4">
+            <h4 className="mb-2 text-sm font-bold uppercase tracking-wide text-slate-600">Actual Cost Summary</h4>
+            <SumRow label="Material" value={sum.material} />
+            <SumRow label="Labour" value={sum.labour} sub={sum.labourDays ? `${sum.labourDays} man-days` : undefined} />
+            <SumRow label="Other expenses" value={sum.expenses} />
+            <SumRow label="Total cost" value={sum.totalCost} bold />
+            <div className="my-2 border-t border-slate-200" />
+            <SumRow label="Contract value" value={sum.contractValue} />
+            <SumRow
+              label={sum.profit < 0 ? 'Loss' : 'Profit'}
+              value={sum.profit}
+              bold
+              cls={sum.profit < 0 ? 'text-red-600' : 'text-emerald-700'}
+              sub={sum.contractValue ? `${sum.marginPct}% margin` : 'set contract value'}
+            />
+            <div className="my-2 border-t border-slate-200" />
+            <SumRow label="Received from client" value={sum.received} />
+            <SumRow label="Balance to receive" value={round2(sum.contractValue - sum.received)} />
+            <SumRow label="Pending dues (vendors / workers)" value={sum.unpaid} cls="text-amber-700" />
+          </div>
+
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+            <h4 className="mb-2 text-sm font-bold uppercase tracking-wide text-amber-800">Quotation Calculator</h4>
+            <div className="mb-3 grid grid-cols-3 gap-2 print:hidden">
+              <div>
+                <label className={labelCls}>Overhead %</label>
+                <input type="number" step="any" className={inputCls} value={overheadPct} onChange={(e) => setOverheadPct(e.target.value)} />
+              </div>
+              <div>
+                <label className={labelCls}>Profit %</label>
+                <input type="number" step="any" className={inputCls} value={profitPct} onChange={(e) => setProfitPct(e.target.value)} />
+              </div>
+              <div>
+                <label className={labelCls}>GST %</label>
+                <input type="number" step="any" className={inputCls} value={gstPct} onChange={(e) => setGstPct(e.target.value)} />
+              </div>
+            </div>
+            <SumRow label="Base cost" value={sum.totalCost} />
+            <SumRow label={`Overhead (${num(overheadPct)}%)`} value={overhead} />
+            <SumRow label={`Profit (${num(profitPct)}%)`} value={profit} />
+            <SumRow label="Amount before tax" value={beforeTax} bold />
+            <SumRow label={`GST (${num(gstPct)}%)`} value={gst} />
+            <SumRow label="Suggested quote" value={quote} bold cls="text-amber-900 text-base" />
+          </div>
+        </div>
+
+        <DetailTables site={site} data={data} />
       </div>
     </div>
   );
 }
 
-export default function WorkerPage() {
-  const { user, userProfile, workerProfile, loading: authLoading, logout, loginAsDemoWorker, signIn, signUp, refreshWorkerProfile } = useAuth();
-
-  const [activeTab, setActiveTab] = useState<'requests' | 'active' | 'earnings' | 'reviews' | 'profile'>('requests');
-  
-  // Real-time Firestore Job Collections
-  const [assignedJobs, setAssignedJobs] = useState<Job[]>([]);
-  const [loadingJobs, setLoadingJobs] = useState(true);
-
-  // QR Scanner Modal State
-  const [qrScannerJob, setQrScannerJob] = useState<Job | null>(null);
-  const [qrInputPin, setQrInputPin] = useState('');
-  const [isProcessingPunch, setIsProcessingPunch] = useState(false);
-
-  // Real-time Payment & Review History
-  const [myPayments, setMyPayments] = useState<PaymentRecord[]>([]);
-  const [myReviews, setMyReviews] = useState<ReviewRecord[]>([]);
-
-  // Platform Settings
-  const [platformSettings, setPlatformSettings] = useState<PlatformSettings>({ commissionPercentage: 10, currency: '₹' });
-
-  // Notifications
-  const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
-  const [showNotifications, setShowNotifications] = useState(false);
-
-  // Edit Profile State
-  const [editSkills, setEditSkills] = useState('');
-  const [editRate, setEditRate] = useState<number | ''>(600);
-  const [editLocation, setEditLocation] = useState('Delhi NCR');
-  const [editExp, setEditExp] = useState(5);
-  const [isSavingProfile, setIsSavingProfile] = useState(false);
-
-  // Auth Modal State
-  const [showAuthModal, setShowAuthModal] = useState(false);
-  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signup');
-  const [authEmail, setAuthEmail] = useState('');
-  const [authPass, setAuthPass] = useState('');
-  const [authName, setAuthName] = useState('');
-  const [authPhone, setAuthPhone] = useState('');
-  const [authAadhaar, setAuthAadhaar] = useState('');
-  const [authSkill, setAuthSkill] = useState('');
-  const [authPricing, setAuthPricing] = useState<number | ''>('');
-  const [authLocation, setAuthLocation] = useState('');
-  const [authExperience, setAuthExperience] = useState<number | ''>('');
-  const [authError, setAuthError] = useState('');
-  const [authSuccessMsg, setAuthSuccessMsg] = useState('');
-
-  // Sync edit profile form
-  useEffect(() => {
-    if (workerProfile) {
-      setEditSkills(workerProfile.skills?.join(', ') || 'Plumbing, Pipefitting');
-      setEditRate(workerProfile.pricing || 650);
-      setEditLocation(workerProfile.location || 'Delhi NCR');
-      setEditExp(Number(workerProfile.experience) || 5);
-    }
-  }, [workerProfile]);
-
-  // Listen to Jobs assigned to current Worker
-  useEffect(() => {
-    if (authLoading) return;
-
-    const currentUid = user?.uid || workerProfile?.uid || 'worker_john_doe';
-
-    const q = query(
-      collection(db, 'jobs'),
-      where('workerId', '==', currentUid)
-    );
-
-    const unsub = onSnapshot(q, (snapshot) => {
-      const list: Job[] = [];
-      snapshot.forEach((docSnap) => {
-        list.push({ jobId: docSnap.id, ...docSnap.data() } as Job);
-      });
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setAssignedJobs(list);
-      setLoadingJobs(false);
-    }, (err) => {
-      console.error('Worker jobs listener error:', err);
-      setLoadingJobs(false);
-    });
-
-    return () => unsub();
-  }, [authLoading, user, workerProfile]);
-
-  // Listen to Payments and Reviews for current Worker
-  useEffect(() => {
-    if (authLoading) return;
-
-    const currentUid = user?.uid || workerProfile?.uid || 'worker_john_doe';
-
-    // Payments
-    const payQ = query(collection(db, 'payments'), where('workerId', '==', currentUid));
-    const payUnsub = onSnapshot(payQ, (snap) => {
-      const plist: PaymentRecord[] = [];
-      snap.forEach((d) => plist.push({ paymentId: d.id, ...d.data() } as PaymentRecord));
-      setMyPayments(plist);
-    }, (err) => console.warn('Worker payments listener notice:', err));
-
-    // Reviews
-    const revQ = query(collection(db, 'reviews'), where('workerId', '==', currentUid));
-    const revUnsub = onSnapshot(revQ, (snap) => {
-      const rlist: ReviewRecord[] = [];
-      snap.forEach((d) => rlist.push({ reviewId: d.id, ...d.data() } as ReviewRecord));
-      setMyReviews(rlist);
-    }, (err) => console.warn('Worker reviews listener notice:', err));
-
-    // Settings
-    getDoc(doc(db, 'settings', 'platform')).then((d) => {
-      if (d.exists()) setPlatformSettings(d.data() as PlatformSettings);
-    }).catch((e) => console.warn('Worker settings fetch notice:', e));
-
-    // Notifications
-    const notifQ = query(collection(db, 'notifications'), where('recipientId', '==', currentUid));
-    const notifUnsub = onSnapshot(notifQ, (snap) => {
-      const nlist: NotificationRecord[] = [];
-      snap.forEach((d) => nlist.push({ notificationId: d.id, ...d.data() } as NotificationRecord));
-      nlist.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setNotifications(nlist);
-    }, (err) => console.warn('Worker notifications listener notice:', err));
-
-    return () => {
-      payUnsub();
-      revUnsub();
-      notifUnsub();
-    };
-  }, [authLoading, user, workerProfile]);
-
-  // Job Status Transition Function
-  const updateJobStatus = async (jobId: string, nextStatus: JobStatus, customerId?: string) => {
-    try {
-      await updateDoc(doc(db, 'jobs', jobId), {
-        status: nextStatus,
-        updatedAt: new Date().toISOString(),
-      });
-
-      // Notify customer of status change
-      if (customerId) {
-        let msg = `Your job #${jobId.slice(0, 6)} has been updated to ${nextStatus}.`;
-        if (nextStatus === 'ACCEPTED') msg = `Worker ${workerProfile?.name || 'Assigned'} has ACCEPTED your job request!`;
-        if (nextStatus === 'ON_THE_WAY') msg = `Worker is ON THE WAY to your location!`;
-        if (nextStatus === 'STARTED') msg = `Worker has STARTED work on your site.`;
-        if (nextStatus === 'COMPLETED') msg = `Job is COMPLETED! Please proceed to settle payment.`;
-
-        await addDoc(collection(db, 'notifications'), {
-          recipientId: customerId,
-          title: `Job Status: ${nextStatus}`,
-          message: msg,
-          type: 'job_status',
-          read: false,
-          createdAt: new Date().toISOString(),
-        });
-      }
-    } catch (err: any) {
-      console.error('Error updating job status:', err);
-      alert(`Status update error: ${err.message}`);
-    }
-  };
-
-  // Punch In via QR Scan / Security PIN
-  const handlePunchIn = async (job: Job) => {
-    setIsProcessingPunch(true);
-    try {
-      const now = new Date().toISOString();
-      const nextToken = Math.floor(100000 + Math.random() * 900000).toString();
-
-      await updateDoc(doc(db, 'jobs', job.jobId), {
-        status: 'STARTED',
-        punchInTime: now,
-        qrToken: nextToken,
-        updatedAt: now,
-      });
-
-      await addDoc(collection(db, 'notifications'), {
-        recipientId: job.customerId,
-        title: '📱 Shift Started (Punch-In Verified)',
-        message: `${workerProfile?.name || 'Worker'} has checked in & STARTED work on site at ${new Date(now).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}.`,
-        type: 'job_status',
-        read: false,
-        createdAt: now,
-      });
-
-      alert('Shift Punch-In Verified! Real-time work timer is now active.');
-      setQrScannerJob(null);
-      setQrInputPin('');
-    } catch (err: any) {
-      console.error('Punch-In Error:', err);
-      alert(`Punch-In failed: ${err.message}`);
-    } finally {
-      setIsProcessingPunch(false);
-    }
-  };
-
-  // Punch Out via QR Scan / Security PIN
-  const handlePunchOut = async (job: Job) => {
-    setIsProcessingPunch(true);
-    try {
-      const now = new Date().toISOString();
-      const startMs = job.punchInTime ? new Date(job.punchInTime).getTime() : (new Date(now).getTime() - 60000);
-      const endMs = new Date(now).getTime();
-
-      const totalMinutesWorked = Math.max(1, Math.floor((endMs - startMs) / 1000 / 60));
-      const standardMinutes = Math.min(totalMinutesWorked, 480);
-      const overtimeMinutes = Math.max(0, totalMinutesWorked - 480);
-
-      const hourlyRate = job.hourlyRate || Math.round((job.price || 600) / 8) || 120;
-      const standardAmount = Math.round((standardMinutes / 60) * hourlyRate);
-      const overtimeAmount = Math.round((overtimeMinutes / 60) * (hourlyRate * 1.5));
-      const finalPrice = Math.max(hourlyRate, standardAmount + overtimeAmount);
-
-      await updateDoc(doc(db, 'jobs', job.jobId), {
-        status: 'COMPLETED',
-        punchOutTime: now,
-        totalMinutesWorked,
-        standardAmount,
-        overtimeMinutes,
-        overtimeAmount,
-        finalPrice,
-        price: finalPrice,
-        updatedAt: now,
-      });
-
-      await addDoc(collection(db, 'notifications'), {
-        recipientId: job.customerId,
-        title: '⏱️ Shift Finished (Punch-Out Verified)',
-        message: `Shift completed! Total worked: ${Math.floor(totalMinutesWorked / 60)}h ${totalMinutesWorked % 60}m. Final bill: ${platformSettings.currency}${finalPrice} (Includes ${overtimeMinutes}m overtime). Please settle payment.`,
-        type: 'job_status',
-        read: false,
-        createdAt: now,
-      });
-
-      alert(`Punch-Out Verified! Duration: ${Math.floor(totalMinutesWorked / 60)}h ${totalMinutesWorked % 60}m. Calculated bill: ${platformSettings.currency}${finalPrice}`);
-      setQrScannerJob(null);
-      setQrInputPin('');
-    } catch (err: any) {
-      console.error('Punch-Out Error:', err);
-      alert(`Punch-Out failed: ${err.message}`);
-    } finally {
-      setIsProcessingPunch(false);
-    }
-  };
-
-  // Save Worker Profile
-  const handleSaveProfile = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSavingProfile(true);
-
-    try {
-      const targetUid = user?.uid || 'worker_john_doe';
-      const skillsArray = editSkills.split(',').map((s) => s.trim()).filter(Boolean);
-      await setDoc(doc(db, 'workers', targetUid), {
-        pricing: Number(editRate),
-        skills: skillsArray,
-        location: editLocation,
-        experience: Number(editExp),
-        updatedAt: new Date().toISOString(),
-      }, { merge: true });
-
-      await refreshWorkerProfile();
-      alert('Worker profile updated successfully!');
-    } catch (err: any) {
-      alert(`Update failed: ${err.message}`);
-    } finally {
-      setIsSavingProfile(false);
-    }
-  };
-
-  // Auth Submit
-  const handleAuthSubmit = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    setAuthError('');
-    setAuthSuccessMsg('');
-    try {
-      if (authMode === 'signin') {
-        if (!authEmail.trim()) {
-          setAuthError('Please enter your email address');
-          return;
-        }
-        await signIn(authEmail.trim(), authPass || 'pass123456');
-        alert('Signed in successfully!');
-        setShowAuthModal(false);
-      } else {
-        if (!authName.trim()) {
-          setAuthError('Please enter your full name');
-          return;
-        }
-        const phoneDigits = authPhone ? authPhone.replace(/\D/g, '') : '';
-        const finalEmail = authEmail.trim() || `${phoneDigits || Date.now()}@dihadi.co`;
-        const finalPass = authPass || 'pass123456';
-
-        const skillsArr = authSkill ? authSkill.split(',').map((s) => s.trim()).filter(Boolean) : ['General Labor'];
-        await signUp(
-          finalEmail,
-          finalPass,
-          authName.trim(),
-          authPhone || '',
-          authAadhaar || '',
-          skillsArr,
-          Number(authExperience) || 1,
-          authLocation || 'Delhi NCR',
-          Number(authPricing) || 600
-        );
-        setAuthSuccessMsg('Worker registered successfully! Status is PENDING ADMIN APPROVAL.');
-        alert(`Worker account for "${authName.trim()}" created successfully! Status: PENDING ADMIN APPROVAL.`);
-        setShowAuthModal(false);
-      }
-    } catch (err: any) {
-      console.error('Auth submit error:', err);
-      setAuthError(err.message || 'Auth failed');
-      alert(`Submission error: ${err.message || 'Registration failed'}`);
-    }
-  };
-
-  // Filtered Job Lists
-  const pendingRequests = assignedJobs.filter((j) => j.status === 'REQUESTED');
-  const activeJobs = assignedJobs.filter((j) => ['ACCEPTED', 'ON_THE_WAY', 'STARTED'].includes(j.status));
-  const completedJobsList = assignedJobs.filter((j) => ['COMPLETED', 'PAYMENT_PENDING', 'PAID', 'REVIEWED'].includes(j.status));
-
-  // Calculations
-  const totalEarningsGross = myPayments.reduce((acc, p) => acc + (p.amount || 0), 0);
-  const totalCommissionPaid = myPayments.reduce((acc, p) => acc + (p.commission || 0), 0);
-  const totalNetEarnings = totalEarningsGross - totalCommissionPaid;
-
+function SumRow({ label, value, bold, cls, sub }: { label: string; value: number; bold?: boolean; cls?: string; sub?: string }) {
   return (
-    <div className="min-h-screen flex flex-col bg-[#F8FAFC]">
-      {/* Header Bar */}
-      <header className="sticky top-0 w-full z-50 flex justify-between items-center px-6 py-4 bg-slate-900 text-white shadow-md">
-        <div className="flex items-center gap-6">
-          <a href="#" className="text-xl font-bold tracking-tight flex items-center gap-2">
-            <span className="bg-amber-500 text-slate-950 px-2 py-0.5 rounded-lg font-black text-base">W</span>
-            Dihadi.Co <span className="text-amber-400 text-xs font-normal">Worker Portal</span>
-          </a>
-
-          <nav className="hidden md:flex gap-4 ml-4 text-xs font-semibold">
-            <button 
-              onClick={() => setActiveTab('requests')}
-              className={`pb-1 border-b-2 transition-colors flex items-center gap-1.5 ${
-                activeTab === 'requests' ? 'border-amber-400 text-amber-400 font-bold' : 'border-transparent text-slate-300 hover:text-white'
-              }`}
-            >
-              Job Requests
-              {pendingRequests.length > 0 && (
-                <span className="bg-amber-500 text-slate-950 px-2 py-0.2 rounded-full font-extrabold text-[10px]">
-                  {pendingRequests.length}
-                </span>
-              )}
-            </button>
-
-            <button 
-              onClick={() => setActiveTab('active')}
-              className={`pb-1 border-b-2 transition-colors flex items-center gap-1.5 ${
-                activeTab === 'active' ? 'border-amber-400 text-amber-400 font-bold' : 'border-transparent text-slate-300 hover:text-white'
-              }`}
-            >
-              Active Jobs ({activeJobs.length})
-            </button>
-
-            <button 
-              onClick={() => setActiveTab('earnings')}
-              className={`pb-1 border-b-2 transition-colors ${
-                activeTab === 'earnings' ? 'border-amber-400 text-amber-400 font-bold' : 'border-transparent text-slate-300 hover:text-white'
-              }`}
-            >
-              Earnings & History
-            </button>
-
-            <button 
-              onClick={() => setActiveTab('reviews')}
-              className={`pb-1 border-b-2 transition-colors ${
-                activeTab === 'reviews' ? 'border-amber-400 text-amber-400 font-bold' : 'border-transparent text-slate-300 hover:text-white'
-              }`}
-            >
-              My Reviews
-            </button>
-
-            <button 
-              onClick={() => setActiveTab('profile')}
-              className={`pb-1 border-b-2 transition-colors ${
-                activeTab === 'profile' ? 'border-amber-400 text-amber-400 font-bold' : 'border-transparent text-slate-300 hover:text-white'
-              }`}
-            >
-              Worker Profile
-            </button>
-          </nav>
-        </div>
-
-        <div className="flex items-center gap-3">
-          {/* Notifications */}
-          <div className="relative">
-            <button 
-              onClick={() => setShowNotifications(!showNotifications)}
-              className="p-2 rounded-full hover:bg-slate-800 transition-colors relative"
-            >
-              <span className="material-symbols-outlined text-sm">notifications</span>
-              {notifications.some(n => !n.read) && (
-                <span className="absolute top-1 right-1 w-2 h-2 bg-amber-400 rounded-full"></span>
-              )}
-            </button>
-
-            {showNotifications && (
-              <div className="absolute right-0 mt-2 w-80 bg-white text-slate-900 border border-slate-200 rounded-xl shadow-xl z-50 p-3">
-                <h4 className="font-bold text-xs border-b border-slate-100 pb-2 mb-2">Worker Notifications</h4>
-                <div className="max-h-60 overflow-y-auto space-y-2 text-xs">
-                  {notifications.length === 0 ? (
-                    <p className="text-slate-400 text-center py-4">No notifications</p>
-                  ) : (
-                    notifications.map((n) => (
-                      <div key={n.notificationId} className="p-2 bg-slate-50 rounded border border-slate-100">
-                        <p className="font-bold text-slate-900">{n.title}</p>
-                        <p className="text-slate-600 mt-0.5">{n.message}</p>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* User Auth Switcher */}
-          {user ? (
-            <div className="flex items-center gap-3">
-              <div className="text-right hidden sm:block text-xs">
-                <p className="font-bold text-white">{workerProfile?.name || user.displayName || 'John Doe'}</p>
-                <span className="text-[10px] text-amber-400">
-                  {workerProfile?.verificationStatus === 'VERIFIED' ? '✓ Verified Worker' : '⏳ Pending Verification'}
-                </span>
-              </div>
-              <button 
-                onClick={() => logout()}
-                className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1.5 rounded-lg"
-              >
-                Sign Out
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <button 
-                onClick={() => { setAuthMode('signup'); setShowAuthModal(true); }}
-                className="bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm"
-              >
-                + Register Worker Account
-              </button>
-              <button 
-                onClick={() => { setAuthMode('signin'); setShowAuthModal(true); }}
-                className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1.5 rounded-lg"
-              >
-                Sign In
-              </button>
-              <button 
-                onClick={() => loginAsDemoWorker('worker_john_doe', 'John Doe')}
-                className="text-slate-400 hover:text-white text-xs px-2 py-1.5 underline"
-              >
-                Demo Login
-              </button>
-            </div>
-          )}
-        </div>
-      </header>
-
-      {/* Real-time Verification Status Banner */}
-      {user && (
-        <div className="w-full">
-          {workerProfile?.verificationStatus === 'VERIFIED' ? (
-            <div className="bg-emerald-600 text-white px-6 py-2 text-xs font-semibold flex items-center justify-between shadow-inner">
-              <div className="flex items-center gap-2">
-                <span className="material-symbols-outlined text-base">verified</span>
-                <span>Your profile is <strong>VERIFIED by Dihadi Admin</strong>! Customers see your verified trust badge.</span>
-              </div>
-              <span className="bg-emerald-800 text-emerald-100 px-2 py-0.5 rounded text-[10px] font-bold uppercase">Active</span>
-            </div>
-          ) : (
-            <div className="bg-amber-500 text-slate-950 px-6 py-2.5 text-xs font-semibold flex items-center justify-between shadow-inner">
-              <div className="flex items-center gap-2">
-                <span className="material-symbols-outlined text-base">pending_actions</span>
-                <span>Verification Status: <strong>PENDING ADMIN APPROVAL</strong>. Switch to Admin App to click VERIFY.</span>
-              </div>
-              <button 
-                onClick={() => refreshWorkerProfile()}
-                className="bg-slate-950 text-white px-3 py-1 rounded text-[10px] font-bold"
-              >
-                Refresh Status
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Main Body Canvas */}
-      <main className="flex-grow w-full max-w-7xl mx-auto px-4 sm:px-6 py-6">
-        {!user ? (
-          <div className="bg-white border border-slate-200 rounded-2xl p-8 max-w-2xl mx-auto my-12 text-center space-y-5 shadow-md">
-            <div className="w-16 h-16 bg-amber-500/10 text-amber-600 rounded-full flex items-center justify-center mx-auto">
-              <span className="material-symbols-outlined text-3xl">engineering</span>
-            </div>
-            <h2 className="text-2xl font-black text-slate-900">Join Dihadi.Co Workforce</h2>
-            <p className="text-slate-600 text-xs sm:text-sm max-w-md mx-auto">
-              Create your worker profile with your trade skills, location, and daily rate to start receiving job requests from local customers.
-            </p>
-            <div className="flex flex-col sm:flex-row justify-center gap-3 pt-2">
-              <button 
-                onClick={() => { setAuthMode('signup'); setShowAuthModal(true); }}
-                className="bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold text-xs px-6 py-3 rounded-xl shadow-md transition-colors"
-              >
-                + Create New Worker Account
-              </button>
-              <button 
-                onClick={() => { setAuthMode('signin'); setShowAuthModal(true); }}
-                className="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs px-6 py-3 rounded-xl transition-colors"
-              >
-                Sign In Existing Account
-              </button>
-              <button 
-                onClick={() => loginAsDemoWorker('worker_john_doe', 'John Doe')}
-                className="border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs px-4 py-3 rounded-xl transition-colors"
-              >
-                Try Sample Worker Login
-              </button>
-            </div>
-          </div>
-        ) : (
-          <>
-        {activeTab === 'requests' && (
-          <div className="space-y-6">
-            <div className="flex justify-between items-center pb-3 border-b border-slate-200">
-              <div>
-                <h2 className="text-2xl font-bold text-slate-900">Incoming Job Requests</h2>
-                <p className="text-xs text-slate-500">Real-time requests submitted by customers looking for your trade.</p>
-              </div>
-              <span className="bg-amber-100 text-amber-900 font-bold text-xs px-3 py-1 rounded-full border border-amber-200">
-                {pendingRequests.length} Pending Requests
-              </span>
-            </div>
-
-            {loadingJobs ? (
-              <div className="text-center py-12 bg-white rounded-2xl border border-slate-200">
-                <div className="animate-spin w-8 h-8 border-4 border-amber-500 border-t-transparent rounded-full mx-auto mb-2"></div>
-                <p className="text-xs text-slate-500">Listening for real-time customer requests...</p>
-              </div>
-            ) : pendingRequests.length === 0 ? (
-              <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 space-y-3">
-                <span className="material-symbols-outlined text-5xl text-slate-300">notifications_paused</span>
-                <h3 className="font-bold text-slate-800 text-base">No New Requests Right Now</h3>
-                <p className="text-xs text-slate-500 max-w-md mx-auto">
-                  When a customer books you from Customer App, the request will appear here instantly with sound/notification!
-                </p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {pendingRequests.map((job) => (
-                  <div key={job.jobId} className="bg-white border-2 border-amber-400 rounded-2xl p-5 shadow-sm space-y-4 relative overflow-hidden">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <span className="bg-amber-500 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wider">
-                          NEW REQUEST
-                        </span>
-                        <h4 className="font-bold text-slate-900 text-lg mt-1">{job.serviceName}</h4>
-                        <p className="text-xs text-slate-500">Customer: <strong>{job.customerName}</strong></p>
-                      </div>
-                      <div className="text-right">
-                        <span className="text-2xl font-black text-slate-900">{platformSettings.currency}{job.price}</span>
-                        <span className="text-[10px] text-slate-400 block">Offer Daily Rate</span>
-                      </div>
-                    </div>
-
-                    <div className="bg-slate-50 rounded-xl p-3 border border-slate-100 text-xs space-y-1.5">
-                      <p className="flex items-center gap-1.5 text-slate-700">
-                        <span className="material-symbols-outlined text-xs text-slate-400">calendar_today</span>
-                        Scheduled: <strong>{job.scheduledDate} at {job.scheduledTime}</strong>
-                      </p>
-                      <p className="flex items-center gap-1.5 text-slate-700">
-                        <span className="material-symbols-outlined text-xs text-slate-400">location_on</span>
-                        Location: <strong>{job.location}</strong>
-                      </p>
-                      <p className="text-slate-600 pt-1 border-t border-slate-200">
-                        "{job.description}"
-                      </p>
-                    </div>
-
-                    {/* Accept / Reject Buttons */}
-                    <div className="flex gap-3 pt-2">
-                      <button
-                        onClick={() => updateJobStatus(job.jobId, 'CANCELLED', job.customerId)}
-                        className="w-1/3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs py-2.5 rounded-xl transition-colors"
-                      >
-                        Decline
-                      </button>
-                      <button
-                        onClick={() => updateJobStatus(job.jobId, 'ACCEPTED', job.customerId)}
-                        className="w-2/3 bg-amber-500 hover:bg-amber-600 text-slate-950 font-extrabold text-xs py-2.5 rounded-xl shadow-md transition-colors flex items-center justify-center gap-1"
-                      >
-                        <span className="material-symbols-outlined text-sm">check_circle</span>
-                        ACCEPT JOB REQUEST
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 2: ACTIVE JOBS & STATUS CONTROLLER */}
-        {activeTab === 'active' && (
-          <div className="space-y-6">
-            <div className="pb-3 border-b border-slate-200">
-              <h2 className="text-2xl font-bold text-slate-900">Active Jobs & Status Transitions</h2>
-              <p className="text-xs text-slate-500">Update status in real time to inform customer of your arrival, work start, and completion.</p>
-            </div>
-
-            {activeJobs.length === 0 ? (
-              <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 space-y-3">
-                <span className="material-symbols-outlined text-5xl text-slate-300">handyman</span>
-                <h3 className="font-bold text-slate-800 text-base">No Active Jobs Currently</h3>
-                <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                  Accept an incoming request from the Requests tab to start job tracking.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                {activeJobs.map((job) => (
-                  <div key={job.jobId} className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-4">
-                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 pb-3 border-b border-slate-100">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <h4 className="font-bold text-slate-900 text-lg">{job.serviceName}</h4>
-                          <span className="bg-blue-100 text-blue-800 text-xs font-bold px-2.5 py-0.5 rounded-full">
-                            Current Status: {job.status}
-                          </span>
-                        </div>
-                        <p className="text-xs text-slate-500 mt-1">Customer: <strong>{job.customerName}</strong> • {job.location}</p>
-                      </div>
-                      <span className="text-2xl font-black text-slate-900">{platformSettings.currency}{job.price}</span>
-                    </div>
-
-                    {/* Live Worker Shift Timer widget for STARTED jobs */}
-                    {job.status === 'STARTED' && job.punchInTime && (
-                      <LiveWorkerTimer
-                        punchInTime={job.punchInTime}
-                        hourlyRate={job.hourlyRate || Math.round(job.price / 8) || 120}
-                        currency={platformSettings.currency}
-                      />
-                    )}
-
-                    {/* Interactive Worker Status Transition Controls */}
-                    <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
-                      <p className="text-xs font-bold text-slate-800 flex items-center gap-1">
-                        <span className="material-symbols-outlined text-amber-500 text-base">touch_app</span>
-                        Worker Actions & Shift Check-In
-                      </p>
-
-                      <div className="flex flex-wrap gap-3">
-                        {job.status === 'ACCEPTED' && (
-                          <button
-                            onClick={() => updateJobStatus(job.jobId, 'ON_THE_WAY', job.customerId)}
-                            className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs px-5 py-2.5 rounded-xl shadow-md transition-colors flex items-center gap-1.5"
-                          >
-                            <span className="material-symbols-outlined text-sm">directions_run</span>
-                            I Am ON THE WAY
-                          </button>
-                        )}
-
-                        {(job.status === 'ACCEPTED' || job.status === 'ON_THE_WAY') && (
-                          <button
-                            onClick={() => { setQrScannerJob(job); setQrInputPin(job.qrToken || ''); }}
-                            className="bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs px-5 py-2.5 rounded-xl shadow-md transition-colors flex items-center gap-1.5"
-                          >
-                            <span className="material-symbols-outlined text-sm">qr_code_scanner</span>
-                            📷 SCAN QR CODE TO PUNCH-IN
-                          </button>
-                        )}
-
-                        {job.status === 'STARTED' && (
-                          <button
-                            onClick={() => { setQrScannerJob(job); setQrInputPin(job.qrToken || ''); }}
-                            className="bg-slate-900 hover:bg-slate-800 text-white font-black text-xs px-6 py-3 rounded-xl shadow-lg transition-colors flex items-center gap-1.5 text-sm animate-pulse"
-                          >
-                            <span className="material-symbols-outlined text-base">task_alt</span>
-                            🏁 SCAN QR CODE TO PUNCH-OUT & COMPLETE
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 3: EARNINGS & HISTORY */}
-        {activeTab === 'earnings' && (
-          <div className="space-y-6">
-            <div className="pb-3 border-b border-slate-200">
-              <h2 className="text-2xl font-bold text-slate-900">Earnings & Payment Settlement History</h2>
-              <p className="text-xs text-slate-500">Transparent breakdown of gross pay, central platform commission ({platformSettings.commissionPercentage}%), and net payout.</p>
-            </div>
-
-            {/* Metric Overview Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-1">
-                <span className="text-xs font-bold text-slate-500 block">Total Net Worker Earnings</span>
-                <span className="text-3xl font-black text-emerald-600">{platformSettings.currency}{totalNetEarnings}</span>
-              </div>
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-1">
-                <span className="text-xs font-bold text-slate-500 block">Platform Commission Paid</span>
-                <span className="text-3xl font-black text-slate-700">{platformSettings.currency}{totalCommissionPaid}</span>
-              </div>
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-1">
-                <span className="text-xs font-bold text-slate-500 block">Jobs Settled</span>
-                <span className="text-3xl font-black text-amber-600">{myPayments.length}</span>
-              </div>
-            </div>
-
-            {/* Payment History Table */}
-            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
-              <div className="p-4 bg-slate-50 border-b border-slate-200 font-bold text-slate-900 text-sm">
-                Settled Payment Records
-              </div>
-              {myPayments.length === 0 ? (
-                <p className="text-xs text-slate-400 text-center py-8">No payment records logged yet. Payments recorded by customer appear here.</p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs border-collapse">
-                    <thead>
-                      <tr className="bg-slate-100 text-slate-700 border-b border-slate-200">
-                        <th className="p-3 font-bold">Transaction ID</th>
-                        <th className="p-3 font-bold">Job ID</th>
-                        <th className="p-3 font-bold">Gross Amount</th>
-                        <th className="p-3 font-bold">Commission ({platformSettings.commissionPercentage}%)</th>
-                        <th className="p-3 font-bold">Net Payout</th>
-                        <th className="p-3 font-bold">Date</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {myPayments.map((p) => (
-                        <tr key={p.paymentId} className="border-b border-slate-100 hover:bg-slate-50">
-                          <td className="p-3 font-mono text-slate-800">{p.transactionId}</td>
-                          <td className="p-3 font-mono text-slate-600">{p.jobId.slice(0, 8)}</td>
-                          <td className="p-3 font-bold text-slate-900">{platformSettings.currency}{p.amount}</td>
-                          <td className="p-3 text-red-600">-{platformSettings.currency}{p.commission}</td>
-                          <td className="p-3 font-bold text-emerald-600">{platformSettings.currency}{p.workerAmount}</td>
-                          <td className="p-3 text-slate-400">{new Date(p.createdAt).toLocaleDateString()}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* TAB 4: REVIEWS */}
-        {activeTab === 'reviews' && (
-          <div className="space-y-6">
-            <div className="pb-3 border-b border-slate-200">
-              <h2 className="text-2xl font-bold text-slate-900">Customer Feedback & Reviews</h2>
-              <p className="text-xs text-slate-500">Real ratings submitted by customers after job completion.</p>
-            </div>
-
-            {myReviews.length === 0 ? (
-              <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 space-y-2">
-                <span className="material-symbols-outlined text-4xl text-slate-300">star_half</span>
-                <p className="text-xs text-slate-500">No reviews submitted yet.</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {myReviews.map((r) => (
-                  <div key={r.reviewId} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-2">
-                    <div className="flex justify-between items-center">
-                      <span className="font-bold text-slate-900 text-sm">{r.customerName}</span>
-                      <div className="flex text-amber-500">
-                        {Array.from({ length: r.rating || 5 }).map((_, i) => (
-                          <span key={i} className="material-symbols-outlined text-sm">star</span>
-                        ))}
-                      </div>
-                    </div>
-                    <p className="text-xs text-slate-600 italic">"{r.comment}"</p>
-                    <span className="text-[10px] text-slate-400 block">{new Date(r.createdAt).toLocaleDateString()}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 5: PROFILE EDIT */}
-        {activeTab === 'profile' && (
-          <div className="max-w-xl mx-auto bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-5">
-            <div className="pb-3 border-b border-slate-100">
-              <h2 className="text-xl font-bold text-slate-900">Worker Profile & Verification Settings</h2>
-              <p className="text-xs text-slate-500">Update your trade skills, daily pricing, and location.</p>
-            </div>
-
-            <form onSubmit={handleSaveProfile} className="space-y-4 text-xs">
-              <div>
-                <label className="font-bold text-slate-700 block mb-1">Trade Skills (Comma separated)</label>
-                <input 
-                  type="text"
-                  required
-                  value={editSkills}
-                  onChange={(e) => setEditSkills(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-amber-500"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Daily Wage Rate ({platformSettings.currency})</label>
-                  <input 
-                    type="number"
-                    required
-                    value={editRate}
-                    onChange={(e) => setEditRate(e.target.value ? Number(e.target.value) : '')}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-amber-500"
-                  />
-                </div>
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Experience (Years)</label>
-                  <input 
-                    type="number"
-                    required
-                    value={editExp}
-                    onChange={(e) => setEditExp(Number(e.target.value))}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-amber-500"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-700 block mb-1">Base City / Location</label>
-                <input 
-                  type="text"
-                  required
-                  value={editLocation}
-                  onChange={(e) => setEditLocation(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-amber-500"
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={isSavingProfile}
-                className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3 rounded-xl shadow-md transition-colors"
-              >
-                {isSavingProfile ? 'Saving...' : 'Save Profile Changes'}
-              </button>
-            </form>
-          </div>
-        )}
-        </>
-        )}
-      </main>
-
-      {/* Footer */}
-      <footer className="mt-auto py-4 px-6 bg-slate-900 text-slate-400 text-xs border-t border-slate-800">
-        <div className="max-w-7xl mx-auto flex justify-between items-center">
-          <span>Dihadi.Co Worker Portal - Dignity in Daily Labor</span>
-          <span>Status: Verified Firebase Engine</span>
-        </div>
-      </footer>
-
-      {/* Auth / Registration Modal */}
-      {showAuthModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl p-6 max-w-md w-full shadow-2xl relative space-y-4 my-8">
-            <div className="flex justify-between items-center pb-3 border-b border-slate-100">
-              <h3 className="font-bold text-slate-900 text-lg">
-                {authMode === 'signup' ? 'Worker Account Registration' : 'Worker Sign In'}
-              </h3>
-              <button 
-                onClick={() => setShowAuthModal(false)}
-                className="text-slate-400 hover:text-slate-700 text-xl font-bold"
-              >
-                ✕
-              </button>
-            </div>
-
-            {authError && (
-              <div className="p-3 bg-red-50 text-red-700 text-xs rounded-xl border border-red-200 font-semibold">
-                {authError}
-              </div>
-            )}
-
-            {authSuccessMsg && (
-              <div className="p-3 bg-emerald-50 text-emerald-800 text-xs rounded-xl border border-emerald-200 font-semibold">
-                ✓ {authSuccessMsg}
-              </div>
-            )}
-
-            <form onSubmit={handleAuthSubmit} className="space-y-3 text-xs">
-              {authMode === 'signup' && (
-                <>
-                  <div>
-                    <label className="font-bold text-slate-700 block mb-1">Full Name *</label>
-                    <input 
-                      type="text" 
-                      required 
-                      placeholder="e.g. Ramesh Kumar"
-                      value={authName}
-                      onChange={(e) => setAuthName(e.target.value)}
-                      className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="font-bold text-slate-700 block mb-1">Phone Number *</label>
-                      <input 
-                        type="tel" 
-                        required 
-                        placeholder="+91 9876543210"
-                        value={authPhone}
-                        onChange={(e) => setAuthPhone(e.target.value)}
-                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                      />
-                    </div>
-                    <div>
-                      <label className="font-bold text-slate-700 block mb-1">Aadhaar Card No. *</label>
-                      <input 
-                        type="text" 
-                        required 
-                        placeholder="12-digit Aadhaar ID"
-                        maxLength={14}
-                        value={authAadhaar}
-                        onChange={(e) => setAuthAadhaar(e.target.value)}
-                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="font-bold text-slate-700 block mb-1">Trade Skills (Comma-separated) *</label>
-                    <input 
-                      type="text" 
-                      required 
-                      placeholder="e.g. Electrician, Plumber, Mason"
-                      value={authSkill}
-                      onChange={(e) => setAuthSkill(e.target.value)}
-                      className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="font-bold text-slate-700 block mb-1">Daily Wage Rate (₹) *</label>
-                      <input 
-                        type="number" 
-                        required 
-                        placeholder="650"
-                        value={authPricing}
-                        onChange={(e) => setAuthPricing(e.target.value ? Number(e.target.value) : '')}
-                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                      />
-                    </div>
-                    <div>
-                      <label className="font-bold text-slate-700 block mb-1">Experience (Years) *</label>
-                      <input 
-                        type="number" 
-                        required 
-                        value={authExperience}
-                        onChange={(e) => setAuthExperience(Number(e.target.value))}
-                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="font-bold text-slate-700 block mb-1">City / Base Location *</label>
-                    <input 
-                      type="text" 
-                      required 
-                      placeholder="e.g. Delhi NCR, Mumbai, Bengaluru"
-                      value={authLocation}
-                      onChange={(e) => setAuthLocation(e.target.value)}
-                      className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                    />
-                  </div>
-                </>
-              )}
-
-              <div>
-                <label className="font-bold text-slate-700 block mb-1">Email Address *</label>
-                <input 
-                  type="email" 
-                  required 
-                  placeholder="worker@example.com"
-                  value={authEmail}
-                  onChange={(e) => setAuthEmail(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="font-bold text-slate-700 block mb-1">Password *</label>
-                <input 
-                  type="password" 
-                  required 
-                  placeholder="••••••••"
-                  value={authPass}
-                  onChange={(e) => setAuthPass(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-slate-800 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                />
-              </div>
-
-              <button
-                type="button"
-                onClick={() => handleAuthSubmit()}
-                className="w-full bg-amber-500 hover:bg-amber-600 text-slate-950 font-extrabold py-3 rounded-xl shadow-md transition-colors text-xs uppercase tracking-wider mt-2 cursor-pointer"
-              >
-                {authMode === 'signup' ? 'Submit Worker Registration' : 'Sign In'}
-              </button>
-            </form>
-
-            <div className="pt-2 text-center text-xs text-slate-500 border-t border-slate-100">
-              {authMode === 'signup' ? (
-                <p>
-                  Already have an account?{' '}
-                  <button 
-                    onClick={() => setAuthMode('signin')} 
-                    className="text-amber-600 font-bold hover:underline"
-                  >
-                    Sign In
-                  </button>
-                </p>
-              ) : (
-                <p>
-                  New worker?{' '}
-                  <button 
-                    onClick={() => setAuthMode('signup')} 
-                    className="text-amber-600 font-bold hover:underline"
-                  >
-                    Register Account
-                  </button>
-                </p>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* QR SCANNER / SECURITY PIN MODAL FOR WORKER */}
-      {qrScannerJob && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl space-y-5 animate-in fade-in zoom-in duration-150">
-            <div className="flex justify-between items-start pb-3 border-b border-slate-100">
-              <div>
-                <h3 className="text-lg font-bold text-slate-900">
-                  {qrScannerJob.status === 'STARTED' ? '⏱️ Shift Punch-Out' : '📷 Shift Punch-In'}
-                </h3>
-                <p className="text-xs text-slate-500">Scan customer's phone QR or enter PIN</p>
-              </div>
-              <button 
-                onClick={() => setQrScannerJob(null)}
-                className="text-slate-400 hover:text-slate-600 p-1"
-              >
-                <span className="material-symbols-outlined">close</span>
-              </button>
-            </div>
-
-            {/* Camera Scanner Viewfinder simulation */}
-            <div className="bg-slate-900 text-white rounded-2xl p-5 text-center relative overflow-hidden border-2 border-dashed border-amber-400 shadow-inner space-y-2">
-              <div className="w-14 h-14 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center mx-auto border border-amber-400/40 animate-pulse">
-                <span className="material-symbols-outlined text-3xl">qr_code_scanner</span>
-              </div>
-              <p className="text-xs font-bold text-amber-300">Camera Viewfinder Active</p>
-              <p className="text-[10px] text-slate-400">Position camera over QR code displayed on customer's phone.</p>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-700 block">Security PIN Code</label>
-              <input 
-                type="text"
-                placeholder="e.g. 849201"
-                value={qrInputPin}
-                onChange={(e) => setQrInputPin(e.target.value)}
-                className="w-full text-center font-mono text-xl font-bold tracking-widest bg-slate-50 border border-slate-200 rounded-xl py-2 text-slate-900 focus:ring-2 focus:ring-amber-500 focus:outline-none"
-              />
-              <p className="text-[10px] text-slate-400 text-center">PIN is shown below QR code on customer's phone screen</p>
-            </div>
-
-            <div className="pt-1 flex flex-col gap-2">
-              {qrScannerJob.status === 'STARTED' ? (
-                <button
-                  disabled={isProcessingPunch}
-                  onClick={() => handlePunchOut(qrScannerJob)}
-                  className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs py-3 rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 uppercase tracking-wider"
-                >
-                  <span className="material-symbols-outlined text-base">task_alt</span>
-                  {isProcessingPunch ? 'Calculating & Punching Out...' : 'CONFIRM PUNCH-OUT'}
-                </button>
-              ) : (
-                <button
-                  disabled={isProcessingPunch}
-                  onClick={() => handlePunchIn(qrScannerJob)}
-                  className="w-full bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold text-xs py-3 rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 uppercase tracking-wider"
-                >
-                  <span className="material-symbols-outlined text-base">play_arrow</span>
-                  {isProcessingPunch ? 'Verifying & Punching In...' : 'CONFIRM PUNCH-IN'}
-                </button>
-              )}
-              <button
-                onClick={() => setQrScannerJob(null)}
-                className="w-full bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs py-2 rounded-xl"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+    <div className={`flex items-baseline justify-between gap-3 py-1 text-sm ${bold ? 'font-bold' : ''} ${cls ?? ''}`}>
+      <span>
+        {label}
+        {sub && <span className="ml-1 text-xs font-normal text-slate-500">({sub})</span>}
+      </span>
+      <span className="tabular-nums">{money(value)}</span>
     </div>
   );
+}
+
+/** Full itemised list – visible on screen under a toggle and always in print. */
+function DetailTables({ site, data }: { site: Site; data: CostingData }) {
+  const [open, setOpen] = useState(false);
+  const mats = data.materials.filter((m) => m.siteId === site.id).sort((a, b) => a.date.localeCompare(b.date));
+  const labs = data.labour.filter((l) => l.siteId === site.id).sort((a, b) => a.date.localeCompare(b.date));
+  const exps = data.expenses.filter((e) => e.siteId === site.id).sort((a, b) => a.date.localeCompare(b.date));
+  const th = 'px-2 py-1 text-left text-xs font-semibold text-slate-500';
+  const td = 'px-2 py-1';
+
+  return (
+    <div className="mt-6">
+      <button className={btnGhost + ' print:hidden'} onClick={() => setOpen(!open)}>
+        {open ? 'Hide' : 'Show'} itemised details
+      </button>
+      <div className={`${open ? 'block' : 'hidden'} mt-4 space-y-5 print:block`}>
+        <div className="overflow-x-auto">
+          <h4 className="mb-1 text-sm font-bold">Material details</h4>
+          <table className="w-full min-w-[600px] text-xs">
+            <thead><tr className="border-b border-slate-200"><th className={th}>Date</th><th className={th}>Item</th><th className={th}>Vendor</th><th className={th}>Qty</th><th className={th}>Rate</th><th className={th + ' text-right'}>Amount</th></tr></thead>
+            <tbody>
+              {mats.map((m) => (
+                <tr key={m.id} className="border-b border-slate-100">
+                  <td className={td}>{m.date}</td><td className={td}>{m.item} <span className="text-slate-400">({m.category})</span></td><td className={td}>{m.vendor}</td>
+                  <td className={td}>{m.quantity} {m.unit}</td><td className={td}>{money(m.rate)}</td><td className={td + ' text-right tabular-nums'}>{money(m.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="overflow-x-auto">
+          <h4 className="mb-1 text-sm font-bold">Labour details</h4>
+          <table className="w-full min-w-[600px] text-xs">
+            <thead><tr className="border-b border-slate-200"><th className={th}>Date</th><th className={th}>Worker</th><th className={th}>Trade</th><th className={th}>Days / Type</th><th className={th}>Rate</th><th className={th + ' text-right'}>Amount</th></tr></thead>
+            <tbody>
+              {labs.map((l) => (
+                <tr key={l.id} className="border-b border-slate-100">
+                  <td className={td}>{l.date}</td><td className={td}>{l.workerName}</td><td className={td}>{l.trade}</td>
+                  <td className={td}>{l.payType === 'DAILY' ? `${l.days} day(s)` : 'Contract'}</td><td className={td}>{money(l.rate)}</td><td className={td + ' text-right tabular-nums'}>{money(l.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="overflow-x-auto">
+          <h4 className="mb-1 text-sm font-bold">Other expense details</h4>
+          <table className="w-full min-w-[500px] text-xs">
+            <thead><tr className="border-b border-slate-200"><th className={th}>Date</th><th className={th}>Category</th><th className={th}>Description</th><th className={th + ' text-right'}>Amount</th></tr></thead>
+            <tbody>
+              {exps.map((e) => (
+                <tr key={e.id} className="border-b border-slate-100">
+                  <td className={td}>{e.date}</td><td className={td}>{e.category}</td><td className={td}>{e.description}</td><td className={td + ' text-right tabular-nums'}>{money(e.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Entry tabs */
+
+interface TabProps {
+  siteId: string;
+  data: CostingData;
+  update: (fn: (d: CostingData) => CostingData) => void;
+}
+
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4">
+      <h3 className="mb-3 text-base font-bold">{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+function PaidToggle({ paid, onToggle }: { paid: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      className={`rounded-full px-2 py-0.5 text-xs font-semibold ${paid ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}
+      title="Click to change"
+    >
+      {paid ? 'Paid' : 'Pending'}
+    </button>
+  );
+}
+
+/* Material */
+
+function MaterialTab({ siteId, data, update }: TabProps) {
+  const blank = { date: today(), item: '', category: MATERIAL_CATEGORIES[0], vendor: '', quantity: '', unit: MATERIAL_UNITS[0], rate: '', billNo: '', paid: false, notes: '' };
+  const [f, setF] = useState(blank);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const amount = round2(num(f.quantity) * num(f.rate));
+  const rows = data.materials
+    .filter((m) => m.siteId === siteId)
+    .filter((m) => !search || `${m.item} ${m.vendor} ${m.category}`.toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const vendors = Array.from(new Set(data.materials.map((m) => m.vendor).filter(Boolean))) as string[];
+  const items = Array.from(new Set(data.materials.map((m) => m.item)));
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!f.item.trim()) return;
+    const entry: MaterialEntry = {
+      id: editId ?? newId(),
+      siteId,
+      date: f.date,
+      item: f.item.trim(),
+      category: f.category,
+      vendor: f.vendor.trim(),
+      quantity: num(f.quantity),
+      unit: f.unit,
+      rate: num(f.rate),
+      amount,
+      billNo: f.billNo.trim(),
+      paid: f.paid,
+      notes: f.notes.trim(),
+    };
+    update((d) => ({
+      ...d,
+      materials: editId ? d.materials.map((m) => (m.id === editId ? entry : m)) : [...d.materials, entry],
+    }));
+    setF({ ...blank, date: f.date, category: f.category, vendor: editId ? '' : f.vendor });
+    setEditId(null);
+  };
+
+  const startEdit = (m: MaterialEntry) => {
+    setEditId(m.id);
+    setF({ date: m.date, item: m.item, category: m.category, vendor: m.vendor ?? '', quantity: String(m.quantity), unit: m.unit, rate: String(m.rate), billNo: m.billNo ?? '', paid: m.paid, notes: m.notes ?? '' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const total = rows.reduce((s, m) => s + m.amount, 0);
+
+  return (
+    <div className="space-y-4">
+      <Card title={editId ? 'Edit material entry' : 'Add material'}>
+        <form onSubmit={submit} className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <div><label className={labelCls}>Date</label><input type="date" className={inputCls} value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+          <div className="col-span-2 md:col-span-1">
+            <label className={labelCls}>Item *</label>
+            <input list="mat-items" className={inputCls} value={f.item} onChange={(e) => setF({ ...f, item: e.target.value })} placeholder="e.g. 18mm BWP Ply" required />
+            <datalist id="mat-items">{items.map((i) => <option key={i} value={i} />)}</datalist>
+          </div>
+          <div><label className={labelCls}>Category</label><select className={inputCls} value={f.category} onChange={(e) => setF({ ...f, category: e.target.value })}>{MATERIAL_CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select></div>
+          <div>
+            <label className={labelCls}>Vendor / shop</label>
+            <input list="mat-vendors" className={inputCls} value={f.vendor} onChange={(e) => setF({ ...f, vendor: e.target.value })} />
+            <datalist id="mat-vendors">{vendors.map((v) => <option key={v} value={v} />)}</datalist>
+          </div>
+          <div><label className={labelCls}>Quantity</label><input type="number" step="any" min="0" className={inputCls} value={f.quantity} onChange={(e) => setF({ ...f, quantity: e.target.value })} /></div>
+          <div><label className={labelCls}>Unit</label><select className={inputCls} value={f.unit} onChange={(e) => setF({ ...f, unit: e.target.value })}>{MATERIAL_UNITS.map((u) => <option key={u}>{u}</option>)}</select></div>
+          <div><label className={labelCls}>Rate (₹ / unit)</label><input type="number" step="any" min="0" className={inputCls} value={f.rate} onChange={(e) => setF({ ...f, rate: e.target.value })} /></div>
+          <div><label className={labelCls}>Bill no.</label><input className={inputCls} value={f.billNo} onChange={(e) => setF({ ...f, billNo: e.target.value })} /></div>
+          <div className="col-span-2 md:col-span-2"><label className={labelCls}>Notes</label><input className={inputCls} value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></div>
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={f.paid} onChange={(e) => setF({ ...f, paid: e.target.checked })} /> Paid to vendor</label>
+          <div className="flex items-center justify-between gap-2 md:justify-end">
+            <span className="text-sm font-bold tabular-nums">{money(amount)}</span>
+            <div className="flex gap-2">
+              {editId && <button type="button" className={btnGhost} onClick={() => { setEditId(null); setF(blank); }}>Cancel</button>}
+              <button type="submit" className={btnPrimary}>{editId ? 'Save' : 'Add'}</button>
+            </div>
+          </div>
+        </form>
+      </Card>
+
+      <Card title={`Material entries · ${money(total)}`}>
+        <input className={inputCls + ' mb-3'} placeholder="Search item, vendor or category…" value={search} onChange={(e) => setSearch(e.target.value)} />
+        {rows.length === 0 ? <Empty /> : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[720px] text-sm">
+              <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="py-2">Date</th><th>Item</th><th>Vendor</th><th className="text-right">Qty × Rate</th><th className="text-right">Amount</th><th className="text-center">Status</th><th /></tr></thead>
+              <tbody>
+                {rows.map((m) => (
+                  <tr key={m.id} className="border-t border-slate-100">
+                    <td className="py-2 whitespace-nowrap">{m.date}</td>
+                    <td><div className="font-medium">{m.item}</div><div className="text-xs text-slate-500">{m.category}{m.billNo ? ` · Bill ${m.billNo}` : ''}</div></td>
+                    <td>{m.vendor}</td>
+                    <td className="text-right tabular-nums whitespace-nowrap">{m.quantity} {m.unit} × {money(m.rate)}</td>
+                    <td className="text-right font-semibold tabular-nums">{money(m.amount)}</td>
+                    <td className="text-center"><PaidToggle paid={m.paid} onToggle={() => update((d) => ({ ...d, materials: d.materials.map((x) => (x.id === m.id ? { ...x, paid: !x.paid } : x)) }))} /></td>
+                    <td className="text-right whitespace-nowrap">
+                      <button className={btnSmall} onClick={() => startEdit(m)}>Edit</button>
+                      <button className={btnDanger} onClick={() => window.confirm('Delete this entry?') && update((d) => ({ ...d, materials: d.materials.filter((x) => x.id !== m.id) }))}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* Labour */
+
+function LabourTab({ siteId, data, update }: TabProps) {
+  const blank = { date: today(), workerName: '', trade: LABOUR_TRADES[0], payType: 'DAILY' as LabourPayType, days: '1', rate: '', paid: false, notes: '' };
+  const [f, setF] = useState(blank);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [view, setView] = useState<'entries' | 'workers'>('entries');
+  const amount = labourAmount(f.payType, num(f.days), num(f.rate));
+  const all = data.labour.filter((l) => l.siteId === siteId);
+  const rows = [...all].sort((a, b) => b.date.localeCompare(a.date));
+  const workers = Array.from(new Set(data.labour.map((l) => l.workerName)));
+
+  // remember last rate/trade for a worker to speed up daily entry
+  const pickWorker = (name: string) => {
+    const last = [...data.labour].reverse().find((l) => l.workerName.toLowerCase() === name.toLowerCase());
+    setF((prev) => (last && !editId ? { ...prev, workerName: name, trade: last.trade, payType: last.payType, rate: String(last.rate) } : { ...prev, workerName: name }));
+  };
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!f.workerName.trim()) return;
+    const entry: LabourEntry = {
+      id: editId ?? newId(),
+      siteId,
+      date: f.date,
+      workerName: f.workerName.trim(),
+      trade: f.trade,
+      payType: f.payType,
+      days: f.payType === 'DAILY' ? num(f.days) : 0,
+      rate: num(f.rate),
+      amount,
+      paid: f.paid,
+      notes: f.notes.trim(),
+    };
+    update((d) => ({ ...d, labour: editId ? d.labour.map((l) => (l.id === editId ? entry : l)) : [...d.labour, entry] }));
+    setF({ ...blank, date: f.date });
+    setEditId(null);
+  };
+
+  const startEdit = (l: LabourEntry) => {
+    setEditId(l.id);
+    setF({ date: l.date, workerName: l.workerName, trade: l.trade, payType: l.payType, days: String(l.days || 1), rate: String(l.rate), paid: l.paid, notes: l.notes ?? '' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const byWorker = Object.values(
+    all.reduce<Record<string, { name: string; trade: string; days: number; total: number; pending: number }>>((acc, l) => {
+      const k = l.workerName.toLowerCase();
+      acc[k] ??= { name: l.workerName, trade: l.trade, days: 0, total: 0, pending: 0 };
+      acc[k].days += l.payType === 'DAILY' ? l.days : 0;
+      acc[k].total += l.amount;
+      if (!l.paid) acc[k].pending += l.amount;
+      return acc;
+    }, {}),
+  ).sort((a, b) => b.total - a.total);
+
+  const markWorkerPaid = (name: string) => {
+    if (!window.confirm(`Mark all pending entries of ${name} at this site as paid?`)) return;
+    update((d) => ({
+      ...d,
+      labour: d.labour.map((l) => (l.siteId === siteId && l.workerName.toLowerCase() === name.toLowerCase() ? { ...l, paid: true } : l)),
+    }));
+  };
+
+  const total = all.reduce((s, l) => s + l.amount, 0);
+
+  return (
+    <div className="space-y-4">
+      <Card title={editId ? 'Edit labour entry' : 'Add labour'}>
+        <form onSubmit={submit} className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <div><label className={labelCls}>Date</label><input type="date" className={inputCls} value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+          <div className="col-span-2 md:col-span-1">
+            <label className={labelCls}>Worker / contractor *</label>
+            <input list="lab-workers" className={inputCls} value={f.workerName} onChange={(e) => pickWorker(e.target.value)} required />
+            <datalist id="lab-workers">{workers.map((w) => <option key={w} value={w} />)}</datalist>
+          </div>
+          <div><label className={labelCls}>Trade</label><select className={inputCls} value={f.trade} onChange={(e) => setF({ ...f, trade: e.target.value })}>{LABOUR_TRADES.map((t) => <option key={t}>{t}</option>)}</select></div>
+          <div>
+            <label className={labelCls}>Payment type</label>
+            <select className={inputCls} value={f.payType} onChange={(e) => setF({ ...f, payType: e.target.value as LabourPayType })}>
+              <option value="DAILY">Daily wage (dihadi)</option>
+              <option value="CONTRACT">Contract / lump sum</option>
+            </select>
+          </div>
+          {f.payType === 'DAILY' && (
+            <div><label className={labelCls}>Days (0.5 = half day)</label><input type="number" step="0.5" min="0" className={inputCls} value={f.days} onChange={(e) => setF({ ...f, days: e.target.value })} /></div>
+          )}
+          <div><label className={labelCls}>{f.payType === 'DAILY' ? 'Rate per day (₹)' : 'Contract amount (₹)'}</label><input type="number" step="any" min="0" className={inputCls} value={f.rate} onChange={(e) => setF({ ...f, rate: e.target.value })} /></div>
+          <div className="col-span-2 md:col-span-1"><label className={labelCls}>Notes / work done</label><input className={inputCls} value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></div>
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={f.paid} onChange={(e) => setF({ ...f, paid: e.target.checked })} /> Paid</label>
+          <div className="col-span-2 flex items-center justify-between gap-2 md:col-span-4 md:justify-end">
+            <span className="text-sm font-bold tabular-nums">{money(amount)}</span>
+            <div className="flex gap-2">
+              {editId && <button type="button" className={btnGhost} onClick={() => { setEditId(null); setF(blank); }}>Cancel</button>}
+              <button type="submit" className={btnPrimary}>{editId ? 'Save' : 'Add'}</button>
+            </div>
+          </div>
+        </form>
+      </Card>
+
+      <Card title={`Labour · ${money(total)}`}>
+        <div className="mb-3 flex gap-2">
+          <button className={view === 'entries' ? btnPrimary : btnGhost} onClick={() => setView('entries')}>Entries</button>
+          <button className={view === 'workers' ? btnPrimary : btnGhost} onClick={() => setView('workers')}>Worker-wise hisaab</button>
+        </div>
+        {rows.length === 0 ? <Empty /> : view === 'entries' ? (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[680px] text-sm">
+              <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="py-2">Date</th><th>Worker</th><th>Trade</th><th className="text-right">Days × Rate</th><th className="text-right">Amount</th><th className="text-center">Status</th><th /></tr></thead>
+              <tbody>
+                {rows.map((l) => (
+                  <tr key={l.id} className="border-t border-slate-100">
+                    <td className="py-2 whitespace-nowrap">{l.date}</td>
+                    <td><div className="font-medium">{l.workerName}</div>{l.notes && <div className="text-xs text-slate-500">{l.notes}</div>}</td>
+                    <td>{l.trade}</td>
+                    <td className="text-right tabular-nums whitespace-nowrap">{l.payType === 'DAILY' ? `${l.days} × ${money(l.rate)}` : 'Contract'}</td>
+                    <td className="text-right font-semibold tabular-nums">{money(l.amount)}</td>
+                    <td className="text-center"><PaidToggle paid={l.paid} onToggle={() => update((d) => ({ ...d, labour: d.labour.map((x) => (x.id === l.id ? { ...x, paid: !x.paid } : x)) }))} /></td>
+                    <td className="text-right whitespace-nowrap">
+                      <button className={btnSmall} onClick={() => startEdit(l)}>Edit</button>
+                      <button className={btnDanger} onClick={() => window.confirm('Delete this entry?') && update((d) => ({ ...d, labour: d.labour.filter((x) => x.id !== l.id) }))}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[560px] text-sm">
+              <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="py-2">Worker</th><th>Trade</th><th className="text-right">Days</th><th className="text-right">Total</th><th className="text-right">Pending</th><th /></tr></thead>
+              <tbody>
+                {byWorker.map((w) => (
+                  <tr key={w.name} className="border-t border-slate-100">
+                    <td className="py-2 font-medium">{w.name}</td>
+                    <td>{w.trade}</td>
+                    <td className="text-right tabular-nums">{round2(w.days)}</td>
+                    <td className="text-right tabular-nums">{money(w.total)}</td>
+                    <td className={`text-right font-semibold tabular-nums ${w.pending ? 'text-amber-700' : 'text-emerald-700'}`}>{money(w.pending)}</td>
+                    <td className="text-right">{w.pending > 0 && <button className={btnSmall} onClick={() => markWorkerPaid(w.name)}>Mark all paid</button>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* Other expenses */
+
+function ExpenseTab({ siteId, data, update }: TabProps) {
+  const blank = { date: today(), category: EXPENSE_CATEGORIES[0], description: '', amount: '', paid: true };
+  const [f, setF] = useState(blank);
+  const [editId, setEditId] = useState<string | null>(null);
+  const rows = data.expenses.filter((e) => e.siteId === siteId).sort((a, b) => b.date.localeCompare(a.date));
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!num(f.amount)) return;
+    const entry: ExpenseEntry = { id: editId ?? newId(), siteId, date: f.date, category: f.category, description: f.description.trim(), amount: round2(num(f.amount)), paid: f.paid };
+    update((d) => ({ ...d, expenses: editId ? d.expenses.map((x) => (x.id === editId ? entry : x)) : [...d.expenses, entry] }));
+    setF({ ...blank, date: f.date });
+    setEditId(null);
+  };
+
+  const total = rows.reduce((s, x) => s + x.amount, 0);
+
+  return (
+    <div className="space-y-4">
+      <Card title={editId ? 'Edit expense' : 'Add other expense'}>
+        <form onSubmit={submit} className="grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div><label className={labelCls}>Date</label><input type="date" className={inputCls} value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+          <div><label className={labelCls}>Category</label><select className={inputCls} value={f.category} onChange={(e) => setF({ ...f, category: e.target.value })}>{EXPENSE_CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select></div>
+          <div className="col-span-2"><label className={labelCls}>Description</label><input className={inputCls} value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} placeholder="e.g. Tempo for ply delivery" /></div>
+          <div><label className={labelCls}>Amount (₹) *</label><input type="number" step="any" min="0" className={inputCls} value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} required /></div>
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={f.paid} onChange={(e) => setF({ ...f, paid: e.target.checked })} /> Paid</label>
+          <div className="col-span-1 flex justify-end gap-2 md:col-span-4">
+            {editId && <button type="button" className={btnGhost} onClick={() => { setEditId(null); setF(blank); }}>Cancel</button>}
+            <button type="submit" className={btnPrimary}>{editId ? 'Save' : 'Add'}</button>
+          </div>
+        </form>
+      </Card>
+      <Card title={`Other expenses · ${money(total)}`}>
+        {rows.length === 0 ? <Empty /> : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[560px] text-sm">
+              <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="py-2">Date</th><th>Category</th><th>Description</th><th className="text-right">Amount</th><th className="text-center">Status</th><th /></tr></thead>
+              <tbody>
+                {rows.map((x) => (
+                  <tr key={x.id} className="border-t border-slate-100">
+                    <td className="py-2 whitespace-nowrap">{x.date}</td>
+                    <td>{x.category}</td>
+                    <td>{x.description}</td>
+                    <td className="text-right font-semibold tabular-nums">{money(x.amount)}</td>
+                    <td className="text-center"><PaidToggle paid={x.paid} onToggle={() => update((d) => ({ ...d, expenses: d.expenses.map((y) => (y.id === x.id ? { ...y, paid: !y.paid } : y)) }))} /></td>
+                    <td className="text-right whitespace-nowrap">
+                      <button className={btnSmall} onClick={() => { setEditId(x.id); setF({ date: x.date, category: x.category, description: x.description, amount: String(x.amount), paid: x.paid }); }}>Edit</button>
+                      <button className={btnDanger} onClick={() => window.confirm('Delete this entry?') && update((d) => ({ ...d, expenses: d.expenses.filter((y) => y.id !== x.id) }))}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* Client payments */
+
+function PaymentTab({ siteId, data, update }: TabProps) {
+  const blank = { date: today(), amount: '', mode: PAYMENT_MODES[0], notes: '' };
+  const [f, setF] = useState(blank);
+  const rows = data.payments.filter((p) => p.siteId === siteId).sort((a, b) => b.date.localeCompare(a.date));
+  const sum = summarize(data, siteId);
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!num(f.amount)) return;
+    const entry: Payment = { id: newId(), siteId, date: f.date, amount: round2(num(f.amount)), mode: f.mode, notes: f.notes.trim() };
+    update((d) => ({ ...d, payments: [...d.payments, entry] }));
+    setF({ ...blank, date: f.date });
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card title="Record payment received from client">
+        <form onSubmit={submit} className="grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div><label className={labelCls}>Date</label><input type="date" className={inputCls} value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+          <div><label className={labelCls}>Amount (₹) *</label><input type="number" step="any" min="0" className={inputCls} value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} required /></div>
+          <div><label className={labelCls}>Mode</label><select className={inputCls} value={f.mode} onChange={(e) => setF({ ...f, mode: e.target.value })}>{PAYMENT_MODES.map((m) => <option key={m}>{m}</option>)}</select></div>
+          <div><label className={labelCls}>Notes</label><input className={inputCls} value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} placeholder="e.g. 2nd advance" /></div>
+          <div className="flex items-end justify-end"><button type="submit" className={btnPrimary}>Add</button></div>
+        </form>
+      </Card>
+      <Card title={`Received ${money(sum.received)}${sum.contractValue ? ` of ${money(sum.contractValue)} · Balance ${money(sum.contractValue - sum.received)}` : ''}`}>
+        {rows.length === 0 ? <Empty /> : (
+          <table className="w-full text-sm">
+            <thead className="text-left text-xs uppercase text-slate-500"><tr><th className="py-2">Date</th><th>Mode</th><th>Notes</th><th className="text-right">Amount</th><th /></tr></thead>
+            <tbody>
+              {rows.map((p) => (
+                <tr key={p.id} className="border-t border-slate-100">
+                  <td className="py-2">{p.date}</td><td>{p.mode}</td><td>{p.notes}</td>
+                  <td className="text-right font-semibold tabular-nums">{money(p.amount)}</td>
+                  <td className="text-right"><button className={btnDanger} onClick={() => window.confirm('Delete this payment?') && update((d) => ({ ...d, payments: d.payments.filter((x) => x.id !== p.id) }))}>Delete</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function Empty() {
+  return <p className="py-6 text-center text-sm text-slate-500">No entries yet.</p>;
 }
